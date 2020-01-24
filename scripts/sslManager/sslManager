@@ -1,0 +1,142 @@
+#!/usr/bin/perl
+################################################################################
+use JSON;
+use Data::Dumper;
+################################################################################
+$grep = "/bin/grep";
+$certtool = "/usr/bin/certtool";
+$acme = "/opt/acme.sh/acme.sh";
+$destFolder = "/STORAGE/PEM";
+$webPath = "/www";
+# $staging = "--staging";
+$keysGen = 0;
+$keyAge = 21;
+################################################################################
+################################################################################
+open (IN, "/STORAGE/token/secret.txt");
+my $secretToken = <IN>;
+close (IN);
+################################################################################
+my $hapACL;
+my $hapBE;
+my $hapSVR;
+################################################################################
+@urlList;
+$urlCheck;
+$urlData;
+################################################################################
+my $rawData = `curl -sSk -H "Authorization: Bearer $secretToken" "https://10.96.0.1:443/api/v1/services"`;
+chomp $rawData;
+#####
+$serviceData = decode_json($rawData);
+foreach (@{$serviceData->{'items'}})
+{
+    my $serviceName = $_->{'metadata'}{'name'};
+    my $serviceIP = $_->{'spec'}{'clusterIP'};
+    my $servicePort = $_->{'spec'}{'ports'}[0]{'port'};
+    my $serviceType = $_->{'spec'}{'type'};
+    my $serviceURLC = $_->{'metadata'}{'labels'}{'URLC'};
+    my $serviceList;
+    for ($x = 1;$x<=$serviceURLC;$x++)
+    {
+        my $serviceItem = $_->{'metadata'}{'labels'}{"URL$x"};
+		my @urlPts = split('\.', $serviceItem);
+		my $urlCnt = $#urlPts;
+		my $parentDMN = $urlPts[$urlCnt-1] . "." . $urlPts[$urlCnt];
+		#####
+		$urlData->{$parentDMN}{$serviceItem} = 1;
+    }
+}
+foreach my $parentDMN (keys(%{$urlData}))
+{
+	my $targetFile = $destFolder . "/" . $parentDMN . ".pem";
+	my $fileAge = -M $targetFile;
+	##########
+	my $fileDomains;
+	my $totDomains = 0;
+	my $fndDomains = 0;
+	my $newDomains = "";
+	my $certDomainList = "";
+	##########
+	if (-e $targetFile)
+	{
+		$certDomainsRAW = `$certtool -i < $targetFile | $grep DNSname`; chomp $certDomainsRAW;
+		my @certDomains = split("\n", $certDomainsRAW);
+		foreach (@certDomains)
+		{
+			my ($jnk, $certDomain) = split(": ", $_);
+			$fileDomains->{$certDomain} = 1;
+			if ($certDomainList) { $certDomainList .= ", "; }
+			$certDomainList .= $certDomain;
+		}
+	}
+	##########
+	print "Existing Cert: $parentDMN\n";
+	print "\t$certDomainList\n";
+	##########
+	foreach my $subDMN (keys(%{$urlData->{$parentDMN}}))
+	{
+		$totDomains ++;
+		if ($fileDomains->{$subDMN})
+		{
+			$fndDomains ++;
+		}
+		else
+		{
+			if ($newDomains) { $newDomains .= ", "; }
+			$newDomains .= $subDMN;
+		}
+	}
+	##########
+	if (($fileAge > $keyAge) || (!-e $targetFile) || ($totDomains ne $fndDomains))
+	{
+		print "Generating SSL for $parentDMN\n";
+		print "\tNew Domains: $newDomains\n";
+		my $genSSL_CMD = "$acme --issue ";
+		foreach my $subDMN (keys(%{$urlData->{$parentDMN}}))
+		{
+			$genSSL_CMD .= "-d $subDMN ";
+			print "\t$subDMN\n";
+		}
+		$genSSL_CMD .= "-w /www $staging";
+		#######
+        &writeLog("CMD: $genSSL_CMD");
+        #######
+		my $curAttempt = 0;
+		my $maxAttempt = 5;
+		while ($curAttempt < $maxAttempt)
+		{
+			$curAttempt ++;
+			my $exitCode = system("$genSSL_CMD 1>/dev/null 2>/dev/null");
+            &writeLog("\tAttempt: $curAttempt :: $exitCode");
+			if ($exitCode == 0) { $curAttempt = 99; }
+		}
+        $genPemCMD = "";
+        if (-e "/root/.acme/$parentDMN")
+        {
+            $genPemCMD = "/bin/cat /root/.acme.sh/$parentDMN/fullchain.cer /root/.acme.sh/$parentDMN/$parentDMN.key | /usr/bin/tee $targetFile 1>/dev/null 2>/dev/null";
+        }
+        elsif (-e "/root/.acme/www.$parentDMN")
+        {
+            $genPemCMD = "/bin/cat /root/.acme.sh/www.$parentDMN/fullchain.cer /root/.acme.sh/www.$parentDMN/www.$parentDMN.key | /usr/bin/tee $targetFile 1>/dev/null 2>/dev/null";
+        }
+        &writeLog("GenPEM: $genPemCMD");
+ 		`$genPemCMD`;
+		$keysGen ++;
+	}
+    &writeLog("----------------------------------------------------------");
+}
+if ($keysGen)
+{
+	my $hapPID = `/bin/pidof haproxy`; chomp $hapPID;
+	`/bin/kill $hapPID`;
+	`/usr/sbin/haproxy -f /etc/haproxy/haproxy.cfg -D -p /var/run/haproxy.pid`;
+}
+################################################################################
+sub writeLog
+{
+    my ($line) = @_;
+    open(OUT, ">>/tmp/sslManager.log");
+    print OUT "$line\n";
+    close (OUT);
+}

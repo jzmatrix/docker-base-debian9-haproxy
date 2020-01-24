@@ -1,0 +1,218 @@
+#!/usr/bin/perl
+################################################################################
+use JSON;
+use Data::Dumper;
+################################################################################
+my $haproxyctl = "/opt/haproxyctl/haproxyctl";
+################################################################################
+my $time = time();
+################################################################################
+my ($debug) = @ARGV;
+################################################################################
+my $redirectConfig;
+my $siteConfig;
+my $hapACL;
+my $hapBE;
+my $hapSVR;
+@siteList;
+@nsList;
+################################################################################
+open (IN, "/etc/hapconfig/k8sPass");
+my $k8sPass = <IN>;
+close (IN);
+################################################################################
+open (IN, "/etc/hapconfig/k8sProject");
+my $k8sProject = <IN>;
+close (IN);
+################################################################################
+open (IN, "/etc/hapconfig/k8sUser");
+my $k8sUser = <IN>;
+close (IN);
+################################################################################
+print "k8sUser :: $k8sUser\n";
+print "k8sPass :: $k8sPass\n";
+print "k8sProject :: $k8sProject\n";
+################################################################################
+getNamespaceList();
+getServiceList();
+################################################################################
+foreach (@serviceList)
+{
+	my $serviceIP = siteConfig->{$_}{'IP'};
+	my $servicePort = $siteConfig->{$_}{'PRT'};
+	print "SERVICE :: $_ :: $serviceIP :: $servicePort\n";
+}
+################################################################################
+foreach (@nsList)
+{
+	# print "NS :: $_\n";
+}
+################################################################################
+foreach my $redirectFrom (keys(%{$redirectConfig}))
+{
+	my $redirectTo = $redirectConfig->{$redirectFrom};
+	print "REDIRECT :: $redirectFrom :: $redirectTo\n";
+}
+################################################################################
+foreach (@siteList)
+{
+	my $serviceName = $_;
+	##########
+	my $serviceIP = $siteConfig->{$serviceName}{'IP'};
+	my $servicePort = $siteConfig->{$serviceName}{'PRT'};
+	my $priURL = $siteConfig->{$serviceName}{'URL'};
+	##########
+	$beName = $serviceName;
+	$beName =~ s/\./-/g;
+	##########
+	my $serviceURL = $priURL;
+	$serviceURL =~ s/\./-/g;
+	$siteData->{$beName}{'ACL'} .= "\tacl     $serviceURL   hdr_reg(host)   -i  $priURL\n";
+	$siteData->{$beName}{'BE'} .= "\tuse_backend    $beName   if    $serviceURL\n";
+	##########
+	$siteData->{$beName}{'SVR'} .= "backend $serviceName\n";
+	if ($serviceCheck)
+	{
+		$siteData->{$beName}{'SVR'} .= "\toption\thttpchk HEAD /$serviceCheck\n";
+	}
+	$siteData->{$beName}{'SVR'} .= "\tserver    $serviceName   $serviceIP:$servicePort  check inter 1000";
+	if (!$serviceIP)
+	{
+		$siteData->{$beName}{'SVR'} .= " disabled";
+	}
+	$siteData->{$beName}{'SVR'} .= "\n\n";
+	##########
+	$hapACL .= $siteData->{$serviceName}{'ACL'};
+	$hapBE .= $siteData->{$serviceName}{'BE'};
+	$hapSVR .= $siteData->{$serviceName}{'SVR'};
+}
+################################################################################
+#open (IN, "/opt/hapConfig/haproxy.cfg.tmpl");
+open (IN, "/tmp/hapconfig/hapconfig");
+my $hapConfig;
+while (<IN>)
+{
+  $hapConfig .= $_;
+}
+close (IN);
+################################################################################
+$hapConfig =~ s/##HTTPACL##/$hapACL/g;
+$hapConfig =~ s/##HTTPBACKEND##/$hapBE/g;
+$hapConfig =~ s/##SERVERS##/$hapSVR/g;
+################################################################################
+open (OUT, ">/etc/haproxy/haproxy.cfg.NEW");
+print OUT $hapConfig;
+close (OUT);
+################################################################################
+my $origData = `/usr/bin/md5sum /etc/haproxy/haproxy.cfg 2>/dev/null`; chomp $origData;
+my $newData = `/usr/bin/md5sum /etc/haproxy/haproxy.cfg.NEW 2>/dev/null`; chomp $newData;
+################################################################################
+my ($origMD5, $origFile) = split(" ", $origData);
+my ($newMD5, $newFile) = split(" ", $newData);
+################################################################################
+mkdir ("/etc/haproxy/BU");
+# print "MD5 :: $origMD5 :: $newMD5\n";
+################################################################################
+if (($origMD5 ne $newMD5) && (-e "/etc/haproxy/haproxy.cfg.NEW"))
+{
+    my $buFile = "/etc/haproxy/BU/haproxy.cfg.$time 2>/dev/null";
+    `mv /etc/haproxy/haproxy.cfg $buFile`;
+    `mv $newFile /etc/haproxy/haproxy.cfg`;#
+	######
+	$hapPID = `/bin/pidof haproxy`; chomp $hapPID;
+	`/bin/kill -9 $hapPID`;
+	`/usr/sbin/haproxy -f /etc/haproxy/haproxy.cfg`;
+}
+################################################################################
+################################################################################
+################################################################################
+
+exit;
+
+################################################################################
+################################################################################
+################################################################################
+sub getNamespaceList
+{
+	my $cacheData;
+	my $rawData = `/usr/bin/curl --insecure -q -s -u $k8sUser:$k8sPass "https://rancher.ziemba.net/v3/project/$k8sProject/namespacedserviceaccounttokens"`; chomp $rawData;
+	#############
+	# print "NS RAW :: $rawData\n";
+	#############
+	my $nsData = decode_json($rawData);
+	# print "NS :: " . Dumper($nsData) . "\n";
+	foreach (@{$nsData->{'data'}})
+	{
+		my $nsName = $_->{'namespaceId'};
+		if (!$cacheData->{$nsName})
+		{
+			$cacheData->{$nsName} = 1;
+			push(@nsList, $nsName);
+		}
+	}
+}
+################################################################################
+sub getServiceList
+{
+	my $rawData = `/usr/bin/curl --insecure -q -s -u $k8sUser:$k8sPass "https://rancher.ziemba.net/v3/project/$k8sProject/services"`; chomp $rawData;
+	#############
+	# print "Service RAW :: $rawData\n";
+	#############
+	my $serviceConfig = decode_json($rawData);
+	foreach (@{$serviceConfig->{'data'}})
+	{
+		my $serviceName = $_->{'name'};
+		my $serviceKind = $_->{'kind'};
+		my $serviceURLp = $_->{'labels'}{'URLp'};
+		my $serviceURLc = $_->{'labels'}{'URLC'};
+		my $serviceNoRED = $_->{'labels'}{'noRED'};
+		#########
+		print "SERVICE :: $serviceName\n";
+		#########
+		if (($serviceKind eq "ClusterIP") && ($serviceURLp))
+		{
+			my $serviceIP = $_->{'clusterIp'};
+			my $servicePort = $_->{'ports'}[0]{'targetPort'};
+			#########
+			$siteConfig->{$serviceName}{'IP'} = $serviceIP;
+			$siteConfig->{$serviceName}{'PRT'} = $servicePort;
+			$siteConfig->{$serviceName}{'URL'} = $serviceURLp;
+			push(@siteList, $serviceName);
+			#########
+			# print "SERVICE :: $serviceName :: $serviceIP :: $servicePort\n";
+			# print "SERVICE :: $serviceURLp\n";
+			#########
+			# print "DATA :: " . Dumper($_) . "\n";
+			if (!$serviceNoRED)
+			{
+				for ($x = 0;$x<=$serviceURLc;$x++)
+				{
+					my $serviceURL = $_->{'labels'}{"URL$x"};
+					if ($serviceURL ne $serviceURLp)
+					{
+						$redirectConfig->{$serviceURL} = $serviceURLp;
+					}
+					# print "URL :: $x :: $serviceURL\n";
+				}
+			}
+			else
+			{
+				for ($x = 0;$x<=$serviceURLc;$x++)
+				{
+					my $serviceURL = $_->{'labels'}{"URL$x"};
+					if (($serviceURL ne $serviceURLp) && ($serviceURL))
+					{
+						$serviceName = $serviceURL;
+						##########
+						$siteConfig->{$serviceName}{'IP'} = $serviceIP;
+						$siteConfig->{$serviceName}{'PRT'} = $servicePort;
+						$siteConfig->{$serviceName}{'URL'} = $serviceURL;
+						push(@siteList, $serviceName);
+						##########
+						print "No Redirect :: $serviceName :: $serviceURL\n";
+					}
+				}
+			}
+		}
+	}
+}
